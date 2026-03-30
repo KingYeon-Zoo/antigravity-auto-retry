@@ -6,20 +6,23 @@ Automatically patches Antigravity so transient agent failures trigger one
 automatic retry before the original error notification is shown.
 
 Highlights:
-- Windows install auto-detection
-- macOS default-path fallback
+- Structure-based patching that survives minified variable renames
+- Windows install auto-detection with registry and common-path fallbacks
 - Backup auto-refresh when the app updates
 - Optional restore mode
+- Optional check mode
 """
 
 import argparse
 import glob
 import os
 import platform
+import re
 import shutil
 import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Set, Tuple
+from typing import List, Optional, Pattern, Set, Tuple
 
 
 WORKBENCH_REL = Path("resources") / "app" / "out" / "vs" / "workbench" / "workbench.desktop.main.js"
@@ -32,26 +35,39 @@ ENV_JETSKI_PATH = "ANTIGRAVITY_JETSKI_PATH"
 MAC_APP_BUNDLE = Path("/Applications/Antigravity.app")
 MAC_CONTENTS_ROOT = MAC_APP_BUNDLE / "Contents"
 
+AUTO_RETRY_SET_NAME = "__agAutoRetryIds"
+AUTO_RETRY_NOTIFICATION_NAME = "__agAutoRetryNotification"
 
-WB_PATCHES = [
-    (
-        'case"retryable":return{id:i,icon:n,title:zFo,message:"This error is likely temporary. You can prompt the model to try again after some time.",primaryAction:v("Try again","Try again"),secondaryAction:b()}',
-        'case"retryable":{if(!globalThis._agRetried)globalThis._agRetried=new Set;if(!globalThis._agRetried.has(i)){globalThis._agRetried.add(i);return setTimeout(()=>{p([Hi(D6,{chunk:{case:"text",value:"Try again"}})])},500),void 0}return{id:i,icon:n,title:zFo,message:"This error is likely temporary. You can prompt the model to try again after some time.",primaryAction:v("Try again","Try again"),secondaryAction:b()}}',
-    ),
-    (
-        'case"generic":return{id:i,icon:n,title:zFo,message:L(ps,{children:["You can prompt the model to try again or start a new conversation if the error persists.",o&&L("span",{children:[" ","See our"," ",L("a",{href:o,target:"_blank",rel:"noopener noreferrer",className:"underline opacity-70 transition-opacity hover:opacity-100 cursor-pointer underline-offset-2",children:"troubleshooting guide"})," ","for more help."]})]}),primaryAction:v("Retry","Continue"),secondaryAction:b()}',
-        'case"generic":{if(!globalThis._agRetried)globalThis._agRetried=new Set;if(!globalThis._agRetried.has(i)){globalThis._agRetried.add(i);return setTimeout(()=>{p([Hi(D6,{chunk:{case:"text",value:"Continue"}})])},500),void 0}return{id:i,icon:n,title:zFo,message:L(ps,{children:["You can prompt the model to try again or start a new conversation if the error persists.",o&&L("span",{children:[" ","See our"," ",L("a",{href:o,target:"_blank",rel:"noopener noreferrer",className:"underline opacity-70 transition-opacity hover:opacity-100 cursor-pointer underline-offset-2",children:"troubleshooting guide"})," ","for more help."]})]}),primaryAction:v("Retry","Continue"),secondaryAction:b()}}',
-    ),
-]
 
-JK_PATCHES = [
-    (
-        'case"retryable":return{id:r,icon:n,title:s0n,message:"This error is likely temporary. You can prompt the model to try again after some time.",primaryAction:S("Try again","Try again"),secondaryAction:F()}',
-        'case"retryable":{if(!globalThis._agRetried)globalThis._agRetried=new Set;if(!globalThis._agRetried.has(r)){globalThis._agRetried.add(r);return setTimeout(()=>{v([ur(KS,{chunk:{case:"text",value:"Try again"}})])},500),void 0}return{id:r,icon:n,title:s0n,message:"This error is likely temporary. You can prompt the model to try again after some time.",primaryAction:S("Try again","Try again"),secondaryAction:F()}}',
+@dataclass(frozen=True)
+class CasePatch:
+    case_name: str
+    primary_label: str
+    primary_message: str
+    pattern: Pattern[str]
+
+
+def build_case_pattern(case_name: str, primary_label: str, primary_message: str) -> Pattern[str]:
+    return re.compile(
+        rf'case"{re.escape(case_name)}":return(?P<object>\{{id:(?P<id>[^,]+),(?P<body>.*?)'
+        rf'primaryAction:(?P<action>[A-Za-z_$][\w$]*)\("{re.escape(primary_label)}","{re.escape(primary_message)}"\),'
+        rf'secondaryAction:(?P<secondary>[A-Za-z_$][\w$]*)\(\)\}})',
+        re.DOTALL,
+    )
+
+
+CASE_PATCHES = [
+    CasePatch(
+        case_name="retryable",
+        primary_label="Try again",
+        primary_message="Try again",
+        pattern=build_case_pattern("retryable", "Try again", "Try again"),
     ),
-    (
-        'case"generic":return{id:r,icon:n,title:s0n,message:A(or,{children:["You can prompt the model to try again or start a new conversation if the error persists.",s&&A("span",{children:[" ","See our"," ",A("a",{href:s,target:"_blank",rel:"noopener noreferrer",className:"underline opacity-70 transition-opacity hover:opacity-100 cursor-pointer underline-offset-2",children:"troubleshooting guide"})," ","for more help."]})]}),primaryAction:S("Retry","Continue"),secondaryAction:F()}',
-        'case"generic":{if(!globalThis._agRetried)globalThis._agRetried=new Set;if(!globalThis._agRetried.has(r)){globalThis._agRetried.add(r);return setTimeout(()=>{v([ur(KS,{chunk:{case:"text",value:"Continue"}})])},500),void 0}return{id:r,icon:n,title:s0n,message:A(or,{children:["You can prompt the model to try again or start a new conversation if the error persists.",s&&A("span",{children:[" ","See our"," ",A("a",{href:s,target:"_blank",rel:"noopener noreferrer",className:"underline opacity-70 transition-opacity hover:opacity-100 cursor-pointer underline-offset-2",children:"troubleshooting guide"})," ","for more help."]})]}),primaryAction:S("Retry","Continue"),secondaryAction:F()}}',
+    CasePatch(
+        case_name="generic",
+        primary_label="Retry",
+        primary_message="Continue",
+        pattern=build_case_pattern("generic", "Retry", "Continue"),
     ),
 ]
 
@@ -73,6 +89,11 @@ def parse_args() -> argparse.Namespace:
         "--restore",
         action="store_true",
         help="Restore backed-up original files instead of applying the patch.",
+    )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Check whether the detected files are patchable/already patched without modifying them.",
     )
     return parser.parse_args()
 
@@ -112,7 +133,7 @@ def pair_from_base(base: Path) -> Optional[Tuple[Path, Path]]:
     return None
 
 
-def resolve_pair_from_hint(path_hint) -> Optional[Tuple[Path, Path]]:
+def resolve_pair_from_hint(path_hint: Path) -> Optional[Tuple[Path, Path]]:
     hint = Path(path_hint).expanduser()
     variants: List[Path] = []
 
@@ -203,17 +224,34 @@ def windows_registry_roots() -> List[Path]:
     return dedupe_paths(roots)
 
 
+def windows_default_roots() -> List[Path]:
+    home = Path.home()
+    local_appdata = home / "AppData" / "Local"
+
+    candidates = [
+        local_appdata / "Programs" / "Antigravity",
+        local_appdata / "Programs" / "antigravity-stable-user-x64",
+        local_appdata / "Programs" / "Cloud Code",
+        local_appdata / "Antigravity",
+        Path(r"C:\Antigravity"),
+        Path(r"D:\Antigravity"),
+    ]
+
+    return dedupe_paths(candidates)
+
+
 def windows_glob_roots() -> List[Path]:
     candidates: List[Path] = []
-    local_appdata = os.environ.get("LOCALAPPDATA")
-    program_files = os.environ.get("ProgramFiles")
-    program_files_x86 = os.environ.get("ProgramFiles(x86)")
+    home = Path.home()
+    local_appdata = Path(os.environ.get("LOCALAPPDATA", "")) if os.environ.get("LOCALAPPDATA") else home / "AppData" / "Local"
+    program_files = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+    program_files_x86 = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"))
 
     base_dirs = [
-        Path(local_appdata) / "Programs" if local_appdata else None,
-        Path(local_appdata) if local_appdata else None,
-        Path(program_files) if program_files else None,
-        Path(program_files_x86) if program_files_x86 else None,
+        local_appdata / "Programs",
+        local_appdata,
+        program_files,
+        program_files_x86,
     ]
 
     name_patterns = [
@@ -226,7 +264,7 @@ def windows_glob_roots() -> List[Path]:
     ]
 
     for base_dir in base_dirs:
-        if not base_dir or not base_dir.exists():
+        if not base_dir.exists():
             continue
 
         for pattern in name_patterns:
@@ -268,6 +306,7 @@ def discover_paths(manual_root: Optional[str]) -> Optional[Tuple[Path, Path, str
 
     if platform.system() == "Windows":
         candidate_hints.extend(("registry", path) for path in windows_registry_roots())
+        candidate_hints.extend(("default", path) for path in windows_default_roots())
         candidate_hints.extend(("glob", path) for path in windows_glob_roots())
 
     candidate_hints.append(("macOS default", MAC_CONTENTS_ROOT))
@@ -281,11 +320,65 @@ def discover_paths(manual_root: Optional[str]) -> Optional[Tuple[Path, Path, str
     return None
 
 
-def content_is_fully_unpatched(content: str, patches: List[Tuple[str, str]]) -> bool:
-    return all(content.count(old) == 1 and new not in content for old, new in patches)
+def current_case_marker(case_name: str) -> str:
+    return f'case"{case_name}":{{let {AUTO_RETRY_NOTIFICATION_NAME}='
 
 
-def patch_file(filepath: Path, patches: List[Tuple[str, str]]) -> bool:
+def legacy_case_marker(case_name: str) -> str:
+    return f'case"{case_name}":{{if(!globalThis._agRetried)'
+
+
+def current_case_replacement(case_name: str, object_expr: str) -> str:
+    notification = AUTO_RETRY_NOTIFICATION_NAME
+    retry_set = AUTO_RETRY_SET_NAME
+    return (
+        f'case"{case_name}":{{let {notification}={object_expr};'
+        f'if(!globalThis.{retry_set})globalThis.{retry_set}=new Set;'
+        f'if(!globalThis.{retry_set}.has({notification}.id)){{'
+        f'globalThis.{retry_set}.add({notification}.id);'
+        f'return setTimeout(()=>{{{notification}.primaryAction.onClick()}},500),void 0}}'
+        f"return {notification}}}"
+    )
+
+
+def case_status(content: str, patch: CasePatch) -> Tuple[str, str]:
+    if current_case_marker(patch.case_name) in content:
+        return "patched", "already patched with structure-based matcher"
+    if legacy_case_marker(patch.case_name) in content:
+        return "patched", "already patched with legacy matcher"
+
+    matches = list(patch.pattern.finditer(content))
+    if len(matches) == 1:
+        return "patchable", "signature found"
+    if len(matches) == 0:
+        return "missing", "signature not found"
+    return "ambiguous", f"signature matched {len(matches)} times"
+
+
+def content_is_fully_unpatched(content: str) -> bool:
+    return all(case_status(content, patch)[0] == "patchable" for patch in CASE_PATCHES)
+
+
+def apply_case_patch(content: str, patch: CasePatch) -> Tuple[str, bool, str]:
+    status, detail = case_status(content, patch)
+    if status == "patched":
+        return content, False, f"{patch.case_name}: {detail}"
+    if status == "missing":
+        return content, False, f"{patch.case_name}: signature not found; app version may have changed"
+    if status == "ambiguous":
+        return content, False, f"{patch.case_name}: {detail}"
+
+    matches = list(patch.pattern.finditer(content))
+    match = matches[0]
+    replacement = current_case_replacement(patch.case_name, match.group("object"))
+    updated, count = patch.pattern.subn(replacement, content, count=1)
+
+    if count != 1:
+        return content, False, f"{patch.case_name}: failed to apply replacement"
+    return updated, True, f"{patch.case_name}: patch applied"
+
+
+def patch_file(filepath: Path) -> bool:
     if not filepath.exists():
         print(f"  [ERROR] File not found: {filepath}")
         return False
@@ -298,7 +391,7 @@ def patch_file(filepath: Path, patches: List[Tuple[str, str]]) -> bool:
         print(f"  [OK] Backup created: {backup.name}")
     else:
         backup_content = read_text(backup)
-        if content_is_fully_unpatched(content, patches) and backup_content != content:
+        if content_is_fully_unpatched(content) and backup_content != content:
             shutil.copy2(filepath, backup)
             print(f"  [OK] Backup refreshed for current app version: {backup.name}")
         else:
@@ -307,21 +400,13 @@ def patch_file(filepath: Path, patches: List[Tuple[str, str]]) -> bool:
     updated = content
     changed = False
 
-    for index, (old, new) in enumerate(patches, start=1):
-        old_count = updated.count(old)
-        if old_count == 1:
-            updated = updated.replace(old, new)
-            changed = True
-            print(f"  [OK] Patch {index} applied")
-            continue
-        if old_count > 1:
-            print(f"  [ERROR] Patch {index} matched {old_count} times; expected 1")
+    for index, patch in enumerate(CASE_PATCHES, start=1):
+        updated, case_changed, message = apply_case_patch(updated, patch)
+        if "signature not found" in message or "matched" in message or "failed" in message:
+            print(f"  [ERROR] Patch {index} {message}")
             return False
-        if new in updated:
-            print(f"  [OK] Patch {index} already applied")
-            continue
-        print(f"  [ERROR] Patch {index} signature not found; app version may have changed")
-        return False
+        changed = changed or case_changed
+        print(f"  [OK] Patch {index} {message}")
 
     if changed:
         write_text(filepath, updated)
@@ -329,6 +414,25 @@ def patch_file(filepath: Path, patches: List[Tuple[str, str]]) -> bool:
     else:
         print("  [OK] No changes needed")
     return True
+
+
+def check_file(filepath: Path) -> bool:
+    if not filepath.exists():
+        print(f"  [ERROR] File not found: {filepath}")
+        return False
+
+    content = read_text(filepath)
+    overall_ok = True
+
+    for patch in CASE_PATCHES:
+        status, detail = case_status(content, patch)
+        if status in {"patched", "patchable"}:
+            print(f"  [OK] {patch.case_name}: {detail}")
+            continue
+        overall_ok = False
+        print(f"  [WARN] {patch.case_name}: {detail}")
+
+    return overall_ok
 
 
 def restore_file(filepath: Path) -> bool:
@@ -360,7 +464,7 @@ def main() -> int:
         print("=" * 60)
         print("[ERROR] Could not locate the Antigravity installation.")
         print("Try one of the following:")
-        print(f"  1. Run with --root \"<install_dir>\"")
+        print('  1. Run with --root "<install_dir>"')
         print(f"  2. Set {ENV_INSTALL_DIR}")
         print(f"  3. Set both {ENV_WORKBENCH_PATH} and {ENV_JETSKI_PATH}")
         return 1
@@ -377,17 +481,25 @@ def main() -> int:
 
         print("\n[2/2] Restoring jetskiAgent/main.js")
         result_2 = restore_file(jetski_path)
+    elif args.check:
+        print("\n[1/2] Checking workbench.desktop.main.js")
+        result_1 = check_file(workbench_path)
+
+        print("\n[2/2] Checking jetskiAgent/main.js")
+        result_2 = check_file(jetski_path)
     else:
         print("\n[1/2] Patching workbench.desktop.main.js")
-        result_1 = patch_file(workbench_path, WB_PATCHES)
+        result_1 = patch_file(workbench_path)
 
         print("\n[2/2] Patching jetskiAgent/main.js")
-        result_2 = patch_file(jetski_path, JK_PATCHES)
+        result_2 = patch_file(jetski_path)
 
     print("\n" + "=" * 60)
     if result_1 and result_2:
         if args.restore:
             print("[OK] Restore completed. Restart Antigravity.")
+        elif args.check:
+            print("[OK] Check completed. The current installation is patchable or already patched.")
         else:
             print("[OK] Patch completed. Restart Antigravity.")
     else:
