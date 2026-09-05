@@ -72,6 +72,41 @@ CASE_PATCHES = [
 ]
 
 
+# 1.18.4 的通知使用内联对象；限定按钮、消息和调试动作，且仍要求唯一匹配。
+def inline_case_pattern(patch: CasePatch) -> Pattern[str]:
+    message = (r'"This error is likely temporary\.[^"\n]*"' if patch.case_name == "retryable"
+               else r'[A-Za-z_$][\w$]*\([A-Za-z_$][\w$]*,\{children:\["You can prompt the model to try again or start a new conversation if the error persists\.".{0,2200}?\]\}\)')
+    return re.compile(
+        r'\{id:[A-Za-z_$][\w$]*,icon:[A-Za-z_$][\w$]*,title:[A-Za-z_$][\w$]*,message:' + message +
+        r',primaryAction:\{label:"' + re.escape(patch.primary_label) +
+        r'",onClick:\(\)=>\{[A-Za-z_$][\w$]*\(\[new [A-Za-z_$][\w$]*\(\{chunk:\{case:"text",value:"' +
+        re.escape(patch.primary_message) + r'"\}\}\)\]\)\}\},secondaryAction:\{label:"Copy debug info",onClick:\(\)=>\{[A-Za-z_$][\w$]*\(`Trajectory ID: \$\{[^`\n]+\}\nError: \$\{[^`\n]+\}`\)\}\}\}',
+        re.DOTALL,
+    )
+
+
+def inline_case_marker(case_name: str) -> str:
+    return f"/*__agAutoRetry_inline_{case_name}__*/"
+
+
+def all_case_matches(content: str, patch: CasePatch):
+    return ([("switch", m) for m in patch.pattern.finditer(content)] +
+            [("inline", m) for m in inline_case_pattern(patch).finditer(content)])
+
+
+def inline_case_replacement(case_name: str, object_expr: str) -> str:
+    notification = AUTO_RETRY_NOTIFICATION_NAME
+    retry_set = AUTO_RETRY_SET_NAME
+    return (
+        f"(()=>{{{inline_case_marker(case_name)}let {notification}={object_expr};"
+        f"if(!globalThis.{retry_set})globalThis.{retry_set}=new Set;"
+        f"if(!globalThis.{retry_set}.has({notification}.id)){{"
+        f"globalThis.{retry_set}.add({notification}.id);"
+        f"return setTimeout(()=>{{{notification}.primaryAction.onClick()}},500),void 0}}"
+        f"return {notification}}})()"
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Patch Antigravity to auto-retry transient agent failures once."
@@ -342,12 +377,12 @@ def current_case_replacement(case_name: str, object_expr: str) -> str:
 
 
 def case_status(content: str, patch: CasePatch) -> Tuple[str, str]:
-    if current_case_marker(patch.case_name) in content:
+    if current_case_marker(patch.case_name) in content or inline_case_marker(patch.case_name) in content:
         return "patched", "already patched with structure-based matcher"
     if legacy_case_marker(patch.case_name) in content:
         return "patched", "already patched with legacy matcher"
 
-    matches = list(patch.pattern.finditer(content))
+    matches = all_case_matches(content, patch)
     if len(matches) == 1:
         return "patchable", "signature found"
     if len(matches) == 0:
@@ -368,10 +403,12 @@ def apply_case_patch(content: str, patch: CasePatch) -> Tuple[str, bool, str]:
     if status == "ambiguous":
         return content, False, f"{patch.case_name}: {detail}"
 
-    matches = list(patch.pattern.finditer(content))
-    match = matches[0]
-    replacement = current_case_replacement(patch.case_name, match.group("object"))
-    updated, count = patch.pattern.subn(replacement, content, count=1)
+    matches = all_case_matches(content, patch)
+    style, match = matches[0]
+    replacement = (current_case_replacement(patch.case_name, match.group("object"))
+                   if style == "switch" else inline_case_replacement(patch.case_name, match.group(0)))
+    updated = content[:match.start()] + replacement + content[match.end():]
+    count = 1
 
     if count != 1:
         return content, False, f"{patch.case_name}: failed to apply replacement"
