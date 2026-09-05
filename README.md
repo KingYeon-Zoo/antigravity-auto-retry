@@ -312,3 +312,7 @@ The script will:
 - this is an unofficial patch that modifies local Antigravity files
 - if Antigravity fully rewrites the error notification flow, the matcher may still need an update
 - if `--check` reports `signature not found`, the new app build changed the relevant structure enough to require a new adaptation
+
+## 复核与验证
+
+[2026-09-05 复核记录](docs/reviews/2026-09-05.md)记录本次检查、结果与未覆盖部分。

@@ -1,0 +1,24 @@
+name: 合成样例补丁测试
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: 合成样例补丁测试
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 获取代码
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: 执行检查
+        run: |
+          python3 -m unittest discover -s tests -v
